@@ -1,0 +1,925 @@
+INVOICE RECONCILIATION SYSTEM
+FULL PROJECT DESCRIPTION
+=========================
+
+Document purpose
+----------------
+This document explains the complete invoice reconciliation project as it is
+currently implemented. It covers the user workflow, application architecture,
+file responsibilities, AI processing, privacy boundary, federated learning
+protocol, API endpoints, data structures, error handling, tools, installation,
+execution, validation, and production limitations.
+
+1. PROJECT PURPOSE
+------------------
+The system performs a three-way invoice reconciliation between three PDF
+business documents:
+
+1. Purchase Order, usually called PO.
+2. Goods Received Note or Goods Receipt, usually called GRN.
+3. Commercial Invoice.
+
+The system asks an AI model to compare the documents and report whether the
+invoice agrees with the purchase order and goods receipt.
+
+The reconciliation checks:
+
+- Purchase order number.
+- Goods receipt number.
+- Invoice number.
+- Supplier or vendor name.
+- Line-item descriptions.
+- Quantities ordered, received, and billed.
+- Unit prices.
+- Document totals.
+- Other inconsistencies that the AI can identify from the PDFs.
+
+The project also provides a privacy-preserving federated architecture. The
+client application processes the PDF files locally. The FastAPI server does not
+receive the PDFs, filenames, extracted document fields, AI prompt, or complete
+reconciliation text. The server receives only a small numeric update generated
+after local processing.
+
+2. HIGH-LEVEL ARCHITECTURE
+--------------------------
+The application has two main runtime processes.
+
+A. Streamlit client
+
+File: app.py
+
+The Streamlit application is the client-side application. It:
+
+- Displays the upload interface.
+- Accepts one PO PDF, one GRN PDF, and one invoice PDF.
+- Reads the uploaded PDF bytes in the local client process.
+- Calls vision_llm.py directly.
+- Sends the PDFs directly from the client to Gemini using the Gemini SDK.
+- Displays the complete local reconciliation result to the user.
+- Converts the result into numeric aggregate signals.
+- Sends only the numeric federated update to FastAPI.
+
+B. FastAPI coordinator
+
+File: main.py
+
+The FastAPI application is the federated coordinator. It:
+
+- Reports coordinator configuration.
+- Validates numeric federated updates with Pydantic.
+- Collects updates in memory.
+- Performs weighted FedAvg-style aggregation.
+- Tracks the current federated round.
+- Requires at least two participants before closing a round.
+- Never accepts a PDF upload route.
+
+C. Shared protocol and aggregation logic
+
+File: federated_learning.py
+
+This module is imported by both the client and the server. It contains:
+
+- The federated model version.
+- Pydantic request and response models.
+- Conversion of local reconciliation text into numeric signals.
+- The in-memory federated coordinator.
+- Weighted aggregation logic.
+
+3. COMPLETE USER WORKFLOW
+-------------------------
+The normal workflow is as follows.
+
+Step 1: Start the FastAPI coordinator
+
+The coordinator is started from the project directory with:
+
+    uvicorn main:app --host 127.0.0.1 --port 8001
+
+The server listens locally at:
+
+    http://127.0.0.1:8001
+
+The server does not process the documents. It only waits for numeric federated
+updates from one or more clients.
+
+Step 2: Start the Streamlit client
+
+The client is started in another terminal with:
+
+    streamlit run app.py
+
+Streamlit displays the Invoice Reconciliation System interface.
+
+Step 3: Upload documents
+
+The user selects exactly three PDF files:
+
+- Purchase Order.
+- Goods Received Note.
+- Invoice.
+
+The upload controls accept PDF files only. The current sample directory contains:
+
+- sample_pdfs/PO_10024.pdf
+- sample_pdfs/GRN_8801.pdf
+- sample_pdfs/INV_45091.pdf
+
+Step 4: Press Submit
+
+The client checks that all three files are present. If a file is missing, the
+client shows a warning and does not call Gemini or FastAPI.
+
+Step 5: Process the PDFs locally
+
+The client obtains the bytes of each uploaded PDF by calling Streamlit's
+getvalue() method. These bytes remain in the client process while the local
+analysis function is running.
+
+The client calls:
+
+    analyze_documents(
+        purchase_order.name,
+        purchase_order.getvalue(),
+        goods_receipt.name,
+        goods_receipt.getvalue(),
+        invoice.name,
+        invoice.getvalue(),
+    )
+
+This function is in vision_llm.py. It creates Gemini PDF parts and sends those
+parts to Gemini directly from the client. The FastAPI coordinator is not
+involved in this document analysis step.
+
+Step 6: Display the reconciliation
+
+The Gemini response is shown in the Streamlit interface. The intended response
+format is:
+
+    STATUS: MATCHED or NEEDS REVIEW
+
+    SUMMARY OF DOCUMENTS:
+    - Purchase Order: [PO Number]
+    - Goods Received Note: [GRN Number]
+    - Invoice: [Invoice Number]
+    - Supplier Name: [Supplier]
+
+    DISCREPANCIES FOUND:
+    - [Discrepancies or None]
+
+    RECOMMENDED ACTION:
+    [Recommendation for the finance team]
+
+Step 7: Build a privacy-safe numeric update
+
+The client passes the local result text to build_local_update(). The complete
+result text is not sent to FastAPI.
+
+The current conversion creates these numeric values:
+
+- match_rate:
+  - 1.0 when the result contains STATUS: MATCHED.
+  - 0.0 otherwise.
+
+- discrepancy_rate:
+  - A bounded count of result lines that begin with a hyphen and do not contain
+    the word NONE.
+  - The value is capped at 100.0.
+
+- matched_documents:
+  - 1.0 for a matched status.
+  - 0.0 for any other status.
+
+- discrepancy_count:
+  - The counted discrepancy value.
+
+The result text, PDF bytes, filenames, supplier name, invoice number, and
+individual line items are not placed in the update request.
+
+Step 8: Submit the numeric update
+
+The client sends a JSON request to:
+
+    POST http://127.0.0.1:8001/federated/update
+
+The request contains only the federated update fields. The default client
+identifier is streamlit-client. A different stable non-personally-identifying
+identifier can be configured with FEDERATED_CLIENT_ID.
+
+Step 9: Aggregate updates
+
+FastAPI validates the request and passes it to FederatedCoordinator. The
+coordinator stores the update in memory and calculates the current weighted
+aggregate.
+
+Step 10: Close a round
+
+A round can be closed with:
+
+    POST http://127.0.0.1:8001/federated/round/close
+
+The coordinator requires at least two participants. If fewer than two clients
+have submitted updates, it returns HTTP 409 and keeps the updates available.
+When the round closes, the aggregate is returned, the stored updates are
+cleared, and the round number increments.
+
+4. FILE-BY-FILE DESCRIPTION
+---------------------------
+
+4.1 app.py
+----------
+app.py is the Streamlit user interface and federated client.
+
+Imports:
+
+- os: reads the optional FEDERATED_CLIENT_ID environment variable.
+- streamlit: creates the web interface.
+- requests: sends the numeric update to FastAPI.
+- build_local_update: creates a numeric federated update locally.
+- analyze_documents: performs local Gemini document analysis.
+
+Configuration:
+
+    FEDERATED_API_URL = "http://127.0.0.1:8001"
+
+This is the local FastAPI coordinator address.
+
+    CLIENT_ID = os.getenv("FEDERATED_CLIENT_ID", "streamlit-client")
+
+This identifies the submitting client. It should be a stable identifier that
+does not contain personal or business document information.
+
+Interface controls:
+
+- Page title: Invoice Reconciliation.
+- PO file uploader.
+- Goods Received Note file uploader.
+- Invoice file uploader.
+- Submit button.
+
+On successful local analysis, the UI displays:
+
+- A success message.
+- The complete reconciliation result.
+- A caption confirming that a privacy-safe numeric update was submitted.
+
+Error handling:
+
+- Missing PDF: Streamlit warning.
+- FastAPI connection or HTTP failure: Streamlit error.
+- RuntimeError: Streamlit warning.
+- Other local processing failures: Streamlit error.
+
+4.2 vision_llm.py
+-----------------
+vision_llm.py is the local document-analysis module.
+
+Environment loading:
+
+- It loads .env from the same directory as the file.
+- GEMINI_API_KEY is required.
+- The key is used only by the client-side Gemini call.
+
+Model configuration:
+
+    GEMINI_MODEL
+
+Primary model. The current default is gemini-3.8-flash.
+
+    GEMINI_FALLBACK_MODEL
+
+Fallback model. The current default is gemini-3.1-flash-lite.
+
+    GEMINI_LAST_RESORT_MODEL
+
+Last-resort model. The current default is gemini-flash-latest.
+
+    MAX_RETRIES
+
+The current value is 2. Each model can therefore be attempted up to three
+times: the original request plus two retries.
+
+Document conversion:
+
+Each byte buffer is converted to an official Gemini SDK PDF part with:
+
+    types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+
+The request contents contain:
+
+- The reconciliation instructions.
+- A label for the PO.
+- The PO PDF part.
+- A label for the GRN.
+- The GRN PDF part.
+- A label for the invoice.
+- The invoice PDF part.
+
+The Gemini prompt requires a strict three-way match and a fixed response
+structure.
+
+Retry behavior:
+
+The function retries errors whose text contains any of:
+
+- 503
+- UNAVAILABLE
+- 429
+- 404
+- NOT_FOUND
+
+The retry delay uses exponential delays of 1 second and 2 seconds for the
+configured retry count. A model is abandoned after its attempts are exhausted,
+and the next model is tried.
+
+The model order is:
+
+1. GEMINI_MODEL.
+2. GEMINI_FALLBACK_MODEL.
+3. GEMINI_LAST_RESORT_MODEL.
+
+If all configured models fail, the function returns a local result with:
+
+    STATUS: NEEDS REVIEW
+
+It explains that automatic comparison was not completed and that no document
+data was sent to the server. This prevents a temporary AI service outage from
+becoming an unhandled UI exception.
+
+4.3 federated_learning.py
+-------------------------
+federated_learning.py implements the shared client/coordinator protocol.
+
+Model version:
+
+    MODEL_VERSION = "invoice-reconciliation-1"
+
+Changing this value allows incompatible client and coordinator protocols to be
+detected instead of silently mixed.
+
+FederatedUpdate fields:
+
+    model_version: str
+
+Identifies the protocol/model version. It defaults to MODEL_VERSION and must not
+be empty.
+
+    client_id: str
+
+Identifies the participating client. It must contain between 1 and 128
+characters.
+
+    sample_count: int
+
+Number of local samples represented by the update. It defaults to 1 and is
+restricted to the range 1 through 1000.
+
+    weights: Dict[str, float]
+
+Numeric values that are aggregated as model/update weights. At least one value
+is required and at most 32 keys are accepted.
+
+    metrics: Dict[str, float]
+
+Optional numeric measurements. At most 32 keys are accepted.
+
+AggregatedModel fields:
+
+    model_version
+
+The model/protocol version used for aggregation.
+
+    round_number
+
+The current federated training/reconciliation round.
+
+    weights
+
+The weighted aggregate of submitted update weights.
+
+    participant_count
+
+Number of updates included in the current aggregate.
+
+    sample_count
+
+Total sample count represented by all updates.
+
+    metrics
+
+The weighted aggregate of submitted metrics.
+
+build_local_update():
+
+This function accepts the local result text and client identifier. It performs
+a minimal local interpretation of the result and returns a FederatedUpdate.
+The complete result is never serialized into the request.
+
+FederatedCoordinator:
+
+The coordinator currently stores updates in memory. It is protected by a
+threading.Lock so concurrent FastAPI requests do not update the collection at
+the same time.
+
+The coordinator has:
+
+- model_version, defaulting to MODEL_VERSION.
+- minimum_participants, defaulting to 2.
+- _round_number, initially 1.
+- _updates, initially empty.
+- _lock, used around update and aggregation operations.
+
+add_update():
+
+- Rejects updates with a different model version.
+- Adds the update to the current round.
+- Returns the current aggregate.
+
+current_model():
+
+- Returns an empty aggregate when no updates exist.
+- Otherwise returns the aggregate for the current round.
+
+_aggregate_locked():
+
+The current aggregation is weighted by sample_count. For each update and each
+numeric value:
+
+    weighted_total = value * sample_count
+
+For each field, the final aggregate is:
+
+    aggregate = sum(weighted_total) / total_sample_count
+
+The aggregation is performed separately for weights and metrics. A missing key
+in one update does not cause failure; the key is aggregated from the updates
+that contain it.
+
+close_round():
+
+- Calculates the current aggregate.
+- Rejects closure if participant_count is less than 2.
+- Clears the current updates.
+- Increments the round number.
+- Returns the aggregate that was closed.
+
+This is a simplified FedAvg-style coordinator. It is not a complete secure
+federated learning production platform.
+
+4.4 main.py
+-----------
+main.py creates the FastAPI application and exposes the coordinator endpoints.
+
+Application:
+
+    app = FastAPI(title="Invoice Reconciliation API")
+
+A single in-memory FederatedCoordinator instance is created when the process
+starts.
+
+Root endpoint:
+
+    GET /
+
+Response:
+
+    {"status": "FastAPI is running!"}
+
+Federated configuration endpoint:
+
+    GET /federated/config
+
+Returns:
+
+- model_version.
+- round_number.
+- minimum_participants.
+- A privacy statement confirming that PDFs and extracted fields are processed
+  client-side.
+
+Federated update endpoint:
+
+    POST /federated/update
+
+Request body example:
+
+    {
+      "model_version": "invoice-reconciliation-1",
+      "client_id": "client-a",
+      "sample_count": 1,
+      "weights": {
+        "match_rate": 1.0,
+        "discrepancy_rate": 0.0
+      },
+      "metrics": {
+        "matched_documents": 1.0,
+        "discrepancy_count": 0.0
+      }
+    }
+
+The response is an AggregatedModel. Invalid protocol versions produce HTTP
+400.
+
+Federated round close endpoint:
+
+    POST /federated/round/close
+
+The response is the closed AggregatedModel. If fewer than two participants have
+submitted updates, the endpoint returns HTTP 409.
+
+Important privacy fact:
+
+main.py does not import UploadFile, File, or the Gemini analysis function. It
+has no PDF processing route. The previous raw PDF processing endpoint
+/process-invoice is intentionally absent.
+
+4.5 checking.py
+---------------
+checking.py is a small Gemini connectivity check. It:
+
+- Loads GEMINI_API_KEY from .env.
+- Uses GEMINI_MODEL or gemini-3.8-flash.
+- Sends a short test prompt using the Gemini SDK.
+- Prints the response.
+
+Run it with:
+
+    python checking.py
+
+It is not part of the invoice reconciliation workflow and does not contact the
+FastAPI coordinator.
+
+4.6 requirements.txt
+--------------------
+The project dependencies are:
+
+- fastapi: API framework.
+- uvicorn[standard]: ASGI server used to run FastAPI.
+- python-multipart: multipart form support for FastAPI/related uploads.
+- streamlit: client web interface.
+- requests: HTTP client used by Streamlit to submit federated updates.
+- google-genai: official Gemini Python SDK.
+- dotenv: environment-file loading package used by the current project.
+- pydantic: request and response validation and numeric schema enforcement.
+
+4.7 README.md
+-------------
+README.md contains a short setup summary, the privacy boundary, federated
+endpoints, and a production-hardening checklist.
+
+4.8 .gitignore
+--------------
+The project ignores:
+
+- __pycache__/ directories.
+- Python bytecode files.
+- The venv/ virtual environment.
+- The .env file.
+
+The API key must remain in .env or another secret-management system and must
+not be committed to source control.
+
+4.9 sample_pdfs/
+----------------
+The sample_pdfs directory contains three test inputs:
+
+- PO_10024.pdf: sample purchase order.
+- GRN_8801.pdf: sample goods receipt.
+- INV_45091.pdf: sample invoice.
+
+5. PRIVACY AND DATA FLOW
+------------------------
+The data flow is intentionally split into two stages.
+
+Stage A: private client processing
+
+The Streamlit client has access to:
+
+- The uploaded PDF bytes.
+- PDF filenames.
+- The Gemini API key.
+- The full Gemini prompt.
+- The Gemini response.
+- The full reconciliation result shown to the user.
+
+The client sends the PDFs to Gemini because Gemini performs the document
+understanding. In the current design, the PDFs are not sent to the project's
+FastAPI server.
+
+Stage B: coordinator aggregation
+
+The FastAPI server receives only:
+
+- model_version.
+- client_id.
+- sample_count.
+- Numeric weights.
+- Numeric metrics.
+
+The FastAPI server does not receive:
+
+- PDF bytes.
+- PDF filenames.
+- Purchase order number.
+- Goods receipt number.
+- Invoice number.
+- Supplier name.
+- Line-item descriptions.
+- Quantities.
+- Unit prices.
+- Totals.
+- Gemini prompt.
+- Gemini response.
+- Full reconciliation text.
+
+The privacy boundary is implemented by the architecture, not only by a UI
+statement: main.py has no raw document upload endpoint and app.py sends JSON
+numeric updates instead of multipart PDF files.
+
+Important qualification:
+
+The current application still sends the documents from the client to the
+external Gemini service. Client-side processing protects the project server
+from receiving the documents, but it does not mean that the documents never
+leave the client machine. A deployment requiring that documents never leave a
+private network needs a self-hosted/local model or an approved private AI
+service.
+
+6. FEDERATED LEARNING BEHAVIOR
+------------------------------
+The current implementation is a federated aggregation prototype.
+
+Each client processes its own local document cases and creates an update.
+Clients do not send their raw examples or document fields to the coordinator.
+The coordinator combines numeric values from multiple clients.
+
+For clients with sample counts s_i and values v_i, the aggregate value is:
+
+    aggregate = sum(v_i * s_i) / sum(s_i)
+
+Example:
+
+Client A:
+
+    sample_count = 1
+    match_rate = 1.0
+
+Client B:
+
+    sample_count = 1
+    match_rate = 0.0
+
+Aggregate:
+
+    (1.0 * 1 + 0.0 * 1) / (1 + 1) = 0.5
+
+The current weights and metrics are high-level reconciliation signals. They are
+not neural-network gradients or a trainable model checkpoint. This means the
+current project demonstrates the federated privacy boundary and FedAvg-style
+aggregation, but it does not yet train a document-understanding neural model.
+
+7. API CONTRACT SUMMARY
+-----------------------
+
+GET /
+
+Purpose:
+    Health check.
+
+Request body:
+    None.
+
+GET /federated/config
+
+Purpose:
+    Read model version, current round number, participant requirement, and
+    privacy statement.
+
+Request body:
+    None.
+
+POST /federated/update
+
+Purpose:
+    Submit one client numeric update and receive the current aggregate.
+
+Accepted fields:
+    model_version, client_id, sample_count, weights, metrics.
+
+Rejected or unsafe data:
+    The schema does not contain fields for PDF data or document text.
+
+POST /federated/round/close
+
+Purpose:
+    Close a round after enough participants submit updates.
+
+Minimum participants:
+    2.
+
+Success:
+    Returns the aggregate and starts the next round.
+
+Insufficient participants:
+    HTTP 409.
+
+Unsupported model version:
+    HTTP 400 from the update endpoint.
+
+8. ENVIRONMENT CONFIGURATION
+----------------------------
+The client reads the following variables:
+
+GEMINI_API_KEY
+    Required Gemini API credential. Keep it private and rotate it if exposed.
+
+GEMINI_MODEL
+    Optional primary Gemini model. Default: gemini-3.8-flash.
+
+GEMINI_FALLBACK_MODEL
+    Optional fallback model. Default: gemini-3.1-flash-lite.
+
+GEMINI_LAST_RESORT_MODEL
+    Optional final fallback model. Default: gemini-flash-latest.
+
+FEDERATED_CLIENT_ID
+    Optional client identifier. Default: streamlit-client.
+
+Example configuration, without putting a real key in documentation:
+
+    GEMINI_API_KEY=replace-with-a-secret
+    GEMINI_MODEL=gemini-3.8-flash
+    GEMINI_FALLBACK_MODEL=gemini-3.1-flash-lite
+    GEMINI_LAST_RESORT_MODEL=gemini-flash-latest
+    FEDERATED_CLIENT_ID=client-a
+
+9. INSTALLATION AND RUNNING
+---------------------------
+Open PowerShell in:
+
+    C:\2_MINI_PROJECT\invoice_reconciliation_system-ver3\invoice-reconciliation-system
+
+Create or activate the virtual environment:
+
+    python -m venv venv
+    .\venv\Scripts\Activate.ps1
+
+Install dependencies:
+
+    pip install -r requirements.txt
+
+Create .env and set GEMINI_API_KEY. Do not commit .env.
+
+Start FastAPI in Terminal 1:
+
+    uvicorn main:app --host 127.0.0.1 --port 8001
+
+Start Streamlit in Terminal 2:
+
+    streamlit run app.py
+
+Open the URL displayed by Streamlit, normally:
+
+    http://localhost:8501
+
+Optional connectivity check:
+
+    python checking.py
+
+10. VALIDATION PERFORMED
+------------------------
+The project has been checked with the following kinds of validation:
+
+Python compilation:
+
+    python -m py_compile app.py main.py vision_llm.py federated_learning.py
+
+The federated coordinator was tested with two updates. A match_rate of 1.0 and
+0.0 produced an aggregate match_rate of 0.5.
+
+The FastAPI contract was tested for:
+
+- Successful /federated/config response.
+- Successful federated update submission.
+- Successful two-participant round closure.
+- Absence of the old /process-invoice route.
+
+Gemini connectivity was tested with checking.py. The configured account
+responded successfully using gemini-3.8-flash.
+
+The outage fallback was tested by simulating 503 UNAVAILABLE responses. The
+client returned STATUS: NEEDS REVIEW instead of raising an unhandled exception.
+
+11. CURRENT LIMITATIONS
+-----------------------
+The following limitations are known and intentional in this prototype:
+
+1. The coordinator stores updates only in memory. Restarting FastAPI loses the
+   current round and all submitted updates.
+
+2. There is no authentication. Any client that can reach the endpoint can submit
+   an update.
+
+3. There is no TLS configuration in the local setup.
+
+4. There is no secure aggregation. The coordinator can see each submitted
+   numeric update before aggregation.
+
+5. There is no differential privacy noise or formal privacy budget.
+
+6. There is no replay protection or signed update envelope.
+
+7. Client identifiers are accepted as submitted and are not cryptographically
+   authenticated.
+
+8. The current numeric update is a simple heuristic derived from generated text;
+   it is not a trained gradient update.
+
+9. The discrepancy counter is intentionally simple. It counts bullet-like lines
+   and is not a structured accounting of every document discrepancy.
+
+10. Gemini availability, quotas, rate limits, and external service policy still
+    affect client-side analysis.
+
+11. The fallback result indicates that automatic comparison was not completed;
+    it does not independently reconcile PDF values without Gemini.
+
+12. The server does not persist a global trained model because the current
+    implementation aggregates high-level numeric signals only.
+
+12. RECOMMENDED PRODUCTION IMPROVEMENTS
+---------------------------------------
+Before production use, add:
+
+- Client authentication with rotating credentials or certificates.
+- HTTPS/TLS between clients and the coordinator.
+- Persistent database-backed round and model storage.
+- A participant registry and signed client updates.
+- Replay protection using nonces and round identifiers.
+- Secure aggregation so individual updates are hidden from the coordinator.
+- Differential privacy with clipping and calibrated noise.
+- Rate limiting and abuse protection.
+- Structured local extraction and validation of document fields.
+- A real local/federated trainable model if model training is required.
+- Audit logging that excludes document contents and personally identifying data.
+- Secret management instead of a manually managed .env file.
+- Tests for malformed updates, duplicate clients, model-version mismatch, and
+  concurrent round submissions.
+- Monitoring for Gemini quota, latency, retry, and fallback rates.
+- A policy for whether sending PDFs to the external Gemini service is permitted.
+
+13. TECHNOLOGY SUMMARY
+----------------------
+Frontend/client:
+
+- Python.
+- Streamlit.
+- Streamlit file upload controls.
+- Requests HTTP client.
+
+Coordinator/API:
+
+- Python.
+- FastAPI.
+- Uvicorn.
+- Pydantic.
+- Threading lock for in-process coordination.
+
+AI/document analysis:
+
+- Google Gemini Python SDK, google-genai.
+- Gemini PDF parts with application/pdf MIME type.
+- Primary model: gemini-3.8-flash.
+- Fallback model: gemini-3.1-flash-lite.
+- Last-resort model: gemini-flash-latest.
+
+Federated logic:
+
+- Pydantic schemas.
+- Numeric client updates.
+- Sample-count weighted FedAvg-style aggregation.
+- In-memory round management.
+
+Development and operations:
+
+- Python virtual environment in venv/.
+- PowerShell commands on Windows.
+- .env for local secrets.
+- .gitignore to exclude secrets, the virtual environment, and Python caches.
+
+14. OVERALL SUMMARY
+-------------------
+The project is a local-client invoice reconciliation system with a federated
+coordinator. A user uploads a purchase order, goods receipt, and invoice to the
+Streamlit client. The client sends those PDFs directly to Gemini, receives a
+structured three-way reconciliation, displays the result, converts the result
+to a few numeric signals, and sends only those signals to FastAPI.
+
+FastAPI never receives the original documents or the complete reconciliation
+text. It validates numeric updates, combines them using sample-count weighted
+aggregation, and closes federated rounds after at least two clients participate.
+
+The design therefore separates private document understanding from shared
+aggregate learning/monitoring. It is a working prototype of a privacy-aware
+federated workflow. It is not yet a production-secure federated training
+system, because authentication, secure aggregation, differential privacy,
+persistence, and a true trainable model still need to be implemented.
